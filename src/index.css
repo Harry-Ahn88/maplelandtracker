@@ -1,0 +1,22 @@
+/**
+ * 전역 스타일 (index.css)
+ *
+ * main.jsx 에서 import 되므로, 모든 화면에 공통으로 적용됩니다.
+ * 폰트, 색상 변수, body 기본 스타일 등을 여기 두면 됩니다.
+ */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #1a1a2e;
+  color: #eee;
+  min-height: 100vh;
+  line-height: 1.5;
+}
+
+#root {
+  min-height: 100vh;
+}

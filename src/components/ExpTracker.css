@@ -1,0 +1,430 @@
+/* 카드 레이아웃 · 글래스모피즘 느낌 */
+.exp-tracker {
+  max-width: 720px;
+  width: 100%;
+  padding: 1.75rem 1.5rem 1.5rem;
+  border-radius: 18px;
+  background: radial-gradient(circle at top left, rgba(56, 189, 248, 0.22), transparent 55%),
+    radial-gradient(circle at bottom right, rgba(244, 114, 182, 0.18), transparent 55%),
+    rgba(15, 23, 42, 0.96);
+  box-shadow:
+    0 18px 45px rgba(15, 23, 42, 0.85),
+    0 0 0 1px rgba(148, 163, 184, 0.25);
+  position: relative;
+  overflow: hidden;
+}
+
+.exp-tracker h2,
+.exp-tracker-desc,
+.exp-tracker-hint,
+.exp-tracker-error {
+  text-align: center;
+}
+
+.exp-tracker::before {
+  content: '';
+  position: absolute;
+  inset: -40%;
+  background: conic-gradient(
+    from 180deg,
+    rgba(56, 189, 248, 0.4),
+    rgba(244, 114, 182, 0.4),
+    rgba(129, 140, 248, 0.4),
+    rgba(56, 189, 248, 0.4)
+  );
+  opacity: 0.06;
+  filter: blur(40px);
+  pointer-events: none;
+}
+
+.exp-tracker > * {
+  position: relative;
+  z-index: 1;
+}
+
+.exp-tracker h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.35rem;
+  letter-spacing: 0.03em;
+}
+
+.exp-tracker-desc,
+.exp-tracker-hint {
+  margin: 0 0 1.75rem;
+  color: #94a3b8;
+  font-size: 0.875rem;
+}
+
+.exp-tracker-error {
+  margin: 0 0 1.25rem;
+  color: #f87171;
+  font-size: 0.875rem;
+}
+
+/* 상단 단일 버튼(화면 공유 시작) 위 여백 넉넉히 */
+.exp-tracker > .exp-tracker-btn.primary {
+  margin-top: 1.75rem;
+}
+
+/* 공유 화면 기본: 화면 밖 + 숨김. 크기는 1280x720으로 해서 고해상도 캡처 가능 */
+.exp-tracker-video-wrap {
+  position: fixed;
+  left: -9999px;
+  top: 0;
+  width: 1280px;
+  height: 720px;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.exp-tracker-video-wrap video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* 캡처 직전에만 잠깐 보이게 */
+.exp-tracker-video-wrap--capturing {
+  left: 0;
+  top: 0;
+  visibility: visible;
+  z-index: 9999;
+}
+
+/* 측정 중: 비디오를 2px만 보이게 해서 브라우저가 프레임 디코딩 유지 → OCR이 읽을 수 있음 */
+.exp-tracker-video-wrap--measuring {
+  left: auto;
+  right: 0;
+  bottom: 0;
+  width: 2px;
+  height: 2px;
+  visibility: visible;
+  z-index: -1;
+}
+
+/* 캡처한 한 프레임 + 영역 지정용 */
+.exp-tracker-snapshot-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 960px;
+  margin-bottom: 1rem;
+  background: #0f172a;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.exp-tracker-snapshot-wrap .exp-tracker-snapshot {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 540px;
+  object-fit: contain;
+  vertical-align: top;
+}
+
+.exp-tracker-snapshot-wrap .exp-tracker-overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+  pointer-events: auto;
+}
+
+.exp-tracker-overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+  pointer-events: auto;
+}
+
+/* 스테퍼: 단계 인지 */
+.exp-tracker-stepper {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.78rem;
+  justify-content: center;
+}
+
+.exp-tracker-step {
+  color: #64748b;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  backdrop-filter: blur(8px);
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+}
+
+.exp-tracker-step--active {
+  color: #e5e7eb;
+  border-color: rgba(129, 140, 248, 0.7);
+}
+
+.exp-tracker-step--current {
+  font-weight: 700;
+  color: #e2e8f0;
+  background: radial-gradient(circle at top left, rgba(56, 189, 248, 0.35), rgba(37, 99, 235, 0.55));
+  box-shadow:
+    0 0 18px rgba(56, 189, 248, 0.65),
+    0 0 0 1px rgba(15, 23, 42, 0.8);
+  transform: translateY(-1px);
+}
+
+.exp-tracker-step-hint {
+  margin-bottom: 1.9rem;
+}
+
+.exp-tracker-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+  margin-bottom: 1.25rem;
+  justify-content: center;
+}
+
+.exp-tracker-actions--primary {
+  margin-bottom: 0.9rem;
+}
+
+.exp-tracker-actions--secondary {
+  margin-top: 0.25rem;
+  margin-bottom: 1.4rem;
+}
+
+.exp-tracker-btn--main {
+  font-size: 1rem;
+  padding: 0.7rem 1.6rem;
+  position: relative;
+  isolation: isolate;
+}
+
+/* 측정 시작 버튼은 한 단계 더 강조 */
+.exp-tracker-btn--start {
+  font-size: 1.08rem;
+  padding: 0.9rem 2.2rem;
+}
+
+.exp-tracker-btn--main::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  background: conic-gradient(
+    from 180deg,
+    rgba(56, 189, 248, 0.9),
+    rgba(244, 114, 182, 0.9),
+    rgba(129, 140, 248, 0.9),
+    rgba(56, 189, 248, 0.9)
+  );
+  opacity: 0.7;
+  filter: blur(6px);
+  z-index: -1;
+  animation: exp-tracker-glow 4.2s linear infinite;
+}
+
+@keyframes exp-tracker-glow {
+  0% {
+    opacity: 0.4;
+    transform: scale(0.98);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.02);
+  }
+  100% {
+    opacity: 0.4;
+    transform: scale(0.98);
+  }
+}
+
+.exp-tracker-btn {
+  padding: 0.55rem 1.25rem;
+  font-size: 0.875rem;
+  border: 1px solid #334155;
+  border-radius: 999px;
+  background: radial-gradient(circle at top left, rgba(51, 65, 85, 0.9), rgba(15, 23, 42, 0.95));
+  color: #e2e8f0;
+  cursor: pointer;
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease,
+    box-shadow 0.18s ease,
+    transform 0.12s ease;
+}
+
+.exp-tracker-btn:hover:not(:disabled) {
+  background: radial-gradient(circle at top left, rgba(71, 85, 105, 1), rgba(15, 23, 42, 0.98));
+  box-shadow:
+    0 10px 25px rgba(15, 23, 42, 0.9),
+    0 0 14px rgba(56, 189, 248, 0.35);
+  transform: translateY(-1px);
+}
+
+.exp-tracker-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.exp-tracker-btn.primary {
+  background: radial-gradient(circle at top left, #2563eb, #0ea5e9);
+  border-color: rgba(56, 189, 248, 0.9);
+  color: #f9fafb;
+  box-shadow:
+    0 14px 30px rgba(37, 99, 235, 0.65),
+    0 0 22px rgba(56, 189, 248, 0.6);
+}
+
+.exp-tracker-btn.primary:hover:not(:disabled) {
+  background: radial-gradient(circle at top left, #1d4ed8, #0284c7);
+}
+
+.exp-tracker-btn.danger {
+  background: #7f1d1d;
+  border-color: #991b1b;
+  color: #fff;
+}
+
+.exp-tracker-btn.danger:hover:not(:disabled) {
+  background: #991b1b;
+}
+
+.exp-tracker-btn.secondary {
+  background: transparent;
+  color: #94a3b8;
+}
+
+.exp-tracker-current {
+  font-size: 0.875rem;
+  color: #e2e8f0;
+  display: block;
+  width: 100%;
+  text-align: center;
+}
+
+.exp-tracker-stats {
+  padding: 0.85rem;
+  background: #0f172a;
+  border-radius: 12px;
+  border: 1px solid rgba(56, 189, 248, 0.6);
+  font-size: 0.95rem;
+  box-shadow:
+    0 14px 32px rgba(15, 23, 42, 0.85),
+    0 0 20px rgba(56, 189, 248, 0.45);
+  position: relative;
+  overflow: hidden;
+  margin-top: 1rem;
+}
+
+.exp-tracker-brand {
+  font-size: 0.75rem;
+  color: #93c5fd;
+  text-align: center;
+  margin-bottom: 0.4rem;
+}
+.exp-tracker-title {
+  font-weight: 700;
+  text-align: center;
+  margin-bottom: 0.6rem;
+}
+.exp-tracker-stat-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.5);
+  border-radius: 8px;
+  font-size: 0.85rem;
+  margin-bottom: 0.4rem;
+}
+.exp-tracker-stat-label {
+  color: #cbd5f5;
+}
+.exp-tracker-stat-value {
+  color: #e2e8f0;
+  font-weight: 600;
+}
+.exp-tracker-stat-highlight {
+  border-color: rgba(134, 239, 172, 0.6);
+  background: rgba(22, 163, 74, 0.2);
+  color: #86efac;
+}
+
+.exp-tracker-milestones {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.exp-tracker-milestone {
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  border: 2px solid #5c2a2a;
+  background: rgba(92, 42, 42, 0.2);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+}
+
+.exp-tracker-milestone--passed {
+  border-color: #4ade80;
+  background: rgba(74, 222, 128, 0.12);
+  box-shadow:
+    0 0 10px rgba(74, 222, 128, 0.45),
+    0 0 18px rgba(22, 163, 74, 0.35);
+}
+
+.exp-tracker-milestone--pre {
+  border-color: #fbbf24; /* 노랑 테두리 */
+  animation: exp-milestone-pre 0.8s ease-in-out infinite alternate;
+}
+
+@keyframes exp-milestone-pre {
+  from {
+    box-shadow:
+      0 0 4px rgba(250, 191, 36, 0.35),
+      0 0 10px rgba(250, 204, 21, 0.25);
+  }
+  to {
+    box-shadow:
+      0 0 14px rgba(250, 204, 21, 0.8),
+      0 0 22px rgba(250, 250, 150, 0.5);
+  }
+}
+
+.exp-tracker-milestone-label {
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+.exp-tracker-milestone--passed .exp-tracker-milestone-label {
+  color: #86efac;
+}
+
+.exp-tracker-milestone-value {
+  font-size: 1rem;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+.exp-tracker-milestone-delta {
+  font-size: 0.75rem;
+  opacity: 0.7;
+  margin-left: 4px;
+}
+
+.exp-tracker-milestone--passed .exp-tracker-milestone-value {
+  color: #bbf7d0;
+}

@@ -1,0 +1,1395 @@
+/**
+ * ExpTracker - 경험치 측정 (1~6번 구현)
+ * 화면 공유 → 영역 선택 → OCR → OK → START → 실시간 타이머·EXP/h
+ *
+ * [나중에 적용]
+ * - 해상도 제한: 특정 해상도 내에서만 측정 (너무 작으면 숫자 픽셀 깨져 OCR 불리)
+ * - 프리셋 영역: 비율/해상도가 고정이면 경험치 위치를 미리 정의해 두고, 네모 그리기 생략 가능
+ */
+import { useState, useRef, useEffect } from 'react'
+import Tesseract from 'tesseract.js'
+import './ExpTracker.css'
+
+/**
+ * "23,456,789[45.03%]" 형태에서
+ * - [] 앞 숫자 → 경험치 (쉼표 제거 후 정수)
+ * - [] 안 숫자 → 진행률 퍼센트 (소수 가능)
+ */
+// [나중에] 허용 해상도 제한 시 사용. null = 테스트용 전체 허용
+const ALLOWED_RESOLUTIONS = null // 예: [{ w: 1920, h: 1080 }, { w: 1280, h: 720 }] 또는 { minW: 1280, minH: 720 }
+
+// [나중에] 해상도별 경험치 영역 프리셋 (비율 고정이면 네모 그리기 생략 가능)
+const EXP_REGION_PRESETS = null // 예: { '1920x1080': { x: 100, y: 900, w: 300, h: 40 }, ... }
+
+function parseExpAndPercent(text) {
+  if (!text || typeof text !== 'string') return { exp: null, percent: null }
+  const trimmed = text.trim()
+  // [] 안 진행률: [45.03%] 또는 [45.03] → 퍼센트만 사용 (경험치로 쓰지 않음)
+  const percentMatch = trimmed.match(/\[([\d.]+)%?\]/)
+  const percent = percentMatch ? parseFloat(percentMatch[1]) : null
+  // [] 앞 부분에서 경험치 후보: 1000 미만이면 퍼센트와 혼동 가능하므로 제외 (화면이 작을 때 [] 안 숫자가 경험치로 잡히는 것 방지)
+  const beforeBracket = trimmed.includes('[') ? trimmed.slice(0, trimmed.indexOf('[')) : trimmed
+  const expStr = beforeBracket.replace(/\s|,/g, '')
+  const allNumbers = [...expStr.matchAll(/\d+/g)].map((m) => parseInt(m[0], 10))
+  const expCandidates = allNumbers.filter((n) => n >= 1000)
+  const exp = expCandidates.length > 0 ? Math.max(...expCandidates) : (allNumbers.length > 0 ? Math.max(...allNumbers) : null)
+  return { exp, percent }
+}
+
+function ExpTracker() {
+  // 1번: 화면 공유
+  const [stream, setStream] = useState(null)
+  const [error, setError] = useState(null)
+  const [videoVisibleForCapture, setVideoVisibleForCapture] = useState(false) // 캡처 직전에만 잠깐 표시 (검은 화면 방지)
+  const videoRef = useRef(null)
+  const overlayCanvasRef = useRef(null)
+
+  // 3번: 영역 선택 (캡처한 한 프레임 위에서만 지정, 공유 화면은 항상 숨김)
+  const [showSnapshot, setShowSnapshot] = useState(false) // 캡처 프레임 + 영역 지정 UI 표시 여부
+  const [selection, setSelection] = useState(null) // { x, y, w, h } (스냅샷 캔버스 좌표)
+  const [isDrawing, setIsDrawing] = useState(false)
+  const [isDetecting, setIsDetecting] = useState(false)
+  const drawStartRef = useRef(null)
+  const snapshotCanvasRef = useRef(null)
+  const snapshotDimensionsRef = useRef(null) // { w, h } - 캡처 프레임 크기 (좌표 변환용)
+  const captureCropRef = useRef(null) // 캡처 시 비디오에서 잘라낸 영역 (하단 10%, 가운데 1/3) { x, y, w, h } 비디오 픽셀
+  const selectionVideoRef = useRef(null) // START 시 스냅샷 선택 영역을 비디오 픽셀로 변환해 저장 { x, y, w, h } — 측정 중 OCR은 이 영역만 사용
+
+  // 4~5번: 경험치·OK·START
+  const [currentExp, setCurrentExp] = useState(null)
+  const [currentExpPercent, setCurrentExpPercent] = useState(null) // [] 안 진행률 (45.03 등)
+  const [isReading, setIsReading] = useState(false)
+  const [confirmedExp, setConfirmedExp] = useState(null) // OK 시 확정
+  const [showStart, setShowStart] = useState(false)
+
+  // 6번: 측정 중
+  const [isRunning, setIsRunning] = useState(false)
+  const [startTime, setStartTime] = useState(null)
+  const [startExp, setStartExp] = useState(null)
+  const [elapsedSec, setElapsedSec] = useState(0)
+  const [expGained, setExpGained] = useState(0)
+  const [expPerHour, setExpPerHour] = useState(0)
+  const [milestoneExp, setMilestoneExp] = useState({ 60: null, 120: null, 180: null, 300: null })
+  const intervalRef = useRef(null)
+  const timerRef = useRef(null)
+  const captureDisplaySizeRef = useRef(null)
+  // 탭 전환 후에도 측정 유지: 무음 재생으로 백그라운드 탭 스로틀 완화
+  const silentAudioRef = useRef(null)
+  // PIP: 작은 창에 측정 결과 표시 (aprud.me 스타일)
+  const pipWindowRef = useRef(null)
+  const pipUpdateIntervalRef = useRef(null)
+  const latestStatsRef = useRef({})
+  const lastOcrResultRef = useRef({ exp: null, percent: null })
+  const lastOcrTimeRef = useRef(0)
+  const ocrInFlightRef = useRef(false)
+  const ocrLoopRunningRef = useRef(false)
+  const ocrRafIdRef = useRef(null)
+  // 크롭 캔버스 캐시 (aprud.me cropRegion 캐시 — 메모리·성능)
+  const cropCanvasCacheRef = useRef(new Map())
+  // PIP 창에 표시할 단계/버튼 상태 (PIP이 먼저 열려도 단계별 UI 표시)
+  const pipStateRef = useRef({ step: 2, hint: '', canReadExp: false, canOk: false, canStart: false, currentExp: null, confirmedExp: null, isRunning: false })
+  // 자동 경험치 읽기/OK 플래그 (다시 측정하기 전용)
+  const autoReadDoneRef = useRef(false)
+  const autoOkDoneRef = useRef(false)
+  const autoFlowRef = useRef(false)
+
+  // 스트림을 video 요소에 연결
+  useEffect(() => {
+    if (!videoRef.current || !stream) return
+    videoRef.current.srcObject = stream
+  }, [stream])
+
+  // 해상도 변경 시 안내 (aprud.me: 전체화면/창 전환 시 재감지)
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !stream) return
+    const handleResize = () => {
+      const w = video.videoWidth
+      const h = video.videoHeight
+      if (w > 0 && h > 0 && captureCropRef.current != null && (captureCropRef.current.w !== w || captureCropRef.current.h !== h)) {
+        setError('해상도가 변경되었습니다. 「다시 캡처」를 눌러 주세요.')
+      }
+    }
+    video.addEventListener('resize', handleResize)
+    return () => video.removeEventListener('resize', handleResize)
+  }, [stream])
+
+  // 공유 선택 직후 자동으로 한 프레임 캡처 후 스냅샷 화면 표시
+  useEffect(() => {
+    if (!stream) return
+    const video = videoRef.current
+    const onReady = () => setShowSnapshot(true)
+    if (video && video.readyState >= 2) {
+      const t = setTimeout(onReady, 300)
+      return () => clearTimeout(t)
+    }
+    if (video) {
+      video.addEventListener('loadeddata', onReady, { once: true })
+      const t = setTimeout(onReady, 1500)
+      return () => {
+        video.removeEventListener('loadeddata', onReady)
+        clearTimeout(t)
+      }
+    }
+  }, [stream])
+
+  // 스트림 해제
+  useEffect(() => {
+    return () => {
+      if (stream) {
+        stream.getTracks().forEach((t) => t.stop())
+      }
+      if (intervalRef.current) clearInterval(intervalRef.current)
+      if (timerRef.current) clearInterval(timerRef.current)
+    }
+  }, [stream])
+
+  // 1번: 화면 공유 시작
+  const startScreenShare = async () => {
+    setError(null)
+    // 보안 컨텍스트: localhost 또는 HTTPS 에서만 동작
+    if (!window.isSecureContext) {
+      setError(
+        '화면 공유는 보안 연결에서만 사용할 수 있습니다. 주소창이 https:// 이거나 http://localhost 로 열려 있는지 확인하세요. (파일로 직접 열면 안 됩니다.)'
+      )
+      return
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      setError(
+        '이 브라우저는 화면 공유를 지원하지 않습니다. Chrome, Edge, Firefox 최신 버전에서 http://localhost:5173 으로 접속해 보세요.'
+      )
+      return
+    }
+    try {
+      // 참조 사이트(aprud.me)와 동일: cursor 숨김, 3fps, 최대 1920x1080
+      let mediaStream
+      try {
+        mediaStream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            cursor: 'never',
+            frameRate: { ideal: 3, max: 3 },
+            width: { ideal: 1920, max: 1920 },
+            height: { ideal: 1080, max: 1080 },
+          },
+          audio: false,
+        })
+      } catch (_) {
+        mediaStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+      }
+      // [주석 처리] 메이플스토리 월드에서만 측정 가능하도록 제한
+      // const trackLabel = mediaStream.getVideoTracks()[0]?.label ?? ''
+      // if (!trackLabel.includes('MapleStory Worlds')) {
+      //   mediaStream.getTracks().forEach((t) => t.stop())
+      //   setError('메이플스토리 월드에서만 측정할 수 있습니다. 공유할 창에서 "MapleStory Worlds"를 선택해 주세요.')
+      //   return
+      // }
+      setStream(mediaStream)
+      if (videoRef.current) {
+        videoRef.current.srcObject = mediaStream
+      }
+    } catch (e) {
+      if (e.name === 'NotAllowedError') {
+        setError('화면 공유를 취소하셨거나 허용되지 않았습니다.')
+      } else {
+        setError(e.message || '화면 공유를 시작할 수 없습니다.')
+      }
+    }
+  }
+
+  const stopScreenShare = () => {
+    stopSilentAudio()
+    if (pipUpdateIntervalRef.current) {
+      clearInterval(pipUpdateIntervalRef.current)
+      pipUpdateIntervalRef.current = null
+    }
+    if (ocrRafIdRef.current && videoRef.current?.cancelVideoFrameCallback) {
+      videoRef.current.cancelVideoFrameCallback(ocrRafIdRef.current)
+      ocrRafIdRef.current = null
+    }
+    ocrLoopRunningRef.current = false
+    if (pipWindowRef.current && !pipWindowRef.current.closed) {
+      pipWindowRef.current.close()
+      pipWindowRef.current = null
+    }
+    setShowSnapshot(false)
+    snapshotDimensionsRef.current = null
+    captureCropRef.current = null
+    selectionVideoRef.current = null
+    captureDisplaySizeRef.current = null
+    if (stream) {
+      const tracks = stream.getTracks()
+      tracks.forEach((t) => {
+        t.stop()
+        stream.removeTrack(t)
+      })
+      setStream(null)
+    }
+    const video = videoRef.current
+    if (video) {
+      video.pause()
+      video.srcObject = null
+      video.load()
+    }
+    cropCanvasCacheRef.current.forEach((cached) => {
+      if (cached.canvas) {
+        cached.ctx = null
+        cached.canvas.width = 0
+        cached.canvas.height = 0
+      }
+    })
+    cropCanvasCacheRef.current.clear()
+    setSelection(null)
+    setCurrentExp(null)
+    setCurrentExpPercent(null)
+    setConfirmedExp(null)
+    setShowStart(false)
+    setIsRunning(false)
+    if (intervalRef.current) clearInterval(intervalRef.current)
+    if (timerRef.current) clearInterval(timerRef.current)
+  }
+
+  // 화면 공유 시 하단 영역·가운데 1/3만 캡처. 저해상도에서는 영역 넓히고 스냅샷 확대해 OCR 인식률 확보
+  const captureFrameToSnapshot = async () => {
+    const snap = snapshotCanvasRef.current
+    const overlay = overlayCanvasRef.current
+    const video = videoRef.current
+    if (!snap || !overlay || !stream) return
+
+    const maxW = 1280
+    const MIN_SNAP_WIDTH = 480 // 저해상도에서도 Tesseract가 읽을 수 있도록 최소 너비
+    const CROP_MIDDLE_THIRD = 1 / 3
+    let vw, vh
+    let usedImageCapture = false
+
+    const track = stream.getVideoTracks()[0]
+    if (track && typeof ImageCapture !== 'undefined') {
+      try {
+        const imageCapture = new ImageCapture(track)
+        const imageBitmap = await imageCapture.grabFrame()
+        vw = imageBitmap.width
+        vh = imageBitmap.height
+        const isLowRes = vh < 600
+        const cropBottomRatio = isLowRes ? 0.2 : 0.1
+        const cropX = Math.floor(vw * CROP_MIDDLE_THIRD)
+        const cropY = Math.floor(vh * (1 - cropBottomRatio))
+        const cropW = Math.floor(vw * CROP_MIDDLE_THIRD)
+        const cropH = vh - cropY
+        const sw = cropW < MIN_SNAP_WIDTH ? MIN_SNAP_WIDTH : Math.min(maxW, cropW)
+        const sh = Math.round(cropH * (sw / cropW))
+        snap.width = sw
+        snap.height = sh
+        snap.getContext('2d').drawImage(imageBitmap, cropX, cropY, cropW, cropH, 0, 0, sw, sh)
+        captureCropRef.current = { x: cropX, y: cropY, w: cropW, h: cropH }
+        imageBitmap.close()
+        usedImageCapture = true
+      } catch (_) {}
+    }
+
+    if (!usedImageCapture && video) {
+      setVideoVisibleForCapture(true)
+      await new Promise((r) => setTimeout(r, 600))
+      if (video.readyState >= 2) {
+        vw = video.videoWidth
+        vh = video.videoHeight
+        const isLowRes = vh < 600
+        const cropBottomRatio = isLowRes ? 0.2 : 0.1
+        const cropX = Math.floor(vw * CROP_MIDDLE_THIRD)
+        const cropY = Math.floor(vh * (1 - cropBottomRatio))
+        const cropW = Math.floor(vw * CROP_MIDDLE_THIRD)
+        const cropH = vh - cropY
+        const sw = cropW < MIN_SNAP_WIDTH ? MIN_SNAP_WIDTH : Math.min(maxW, cropW)
+        const sh = Math.round(cropH * (sw / cropW))
+        snap.width = sw
+        snap.height = sh
+        snap.getContext('2d').drawImage(video, cropX, cropY, cropW, cropH, 0, 0, sw, sh)
+        captureCropRef.current = { x: cropX, y: cropY, w: cropW, h: cropH }
+      }
+      setVideoVisibleForCapture(false)
+    }
+
+    overlay.width = snap.width
+    overlay.height = snap.height
+    snapshotDimensionsRef.current = { w: snap.width, h: snap.height }
+    setSelection(null)
+  }
+
+  // 스냅샷 UI가 떴을 때 한 프레임 캡처 후, 경험치 영역 자동 감지 (네모 그리기 없이 최적 영역 사용)
+  useEffect(() => {
+    if (!showSnapshot || !stream) return
+    let cancelled = false
+    const run = async () => {
+      await new Promise((r) => setTimeout(r, 200))
+      if (cancelled) return
+      await captureFrameToSnapshot()
+      if (cancelled) return
+      const region = await detectExpRegion()
+      if (cancelled || !region) return
+      setSelection(region)
+    }
+    run()
+    return () => { cancelled = true }
+  }, [showSnapshot, stream])
+
+  // 3번: 사각형 그리기 (드래그)
+  const getCanvasPoint = (e) => {
+    const canvas = overlayCanvasRef.current
+    if (!canvas) return null
+    const rect = canvas.getBoundingClientRect()
+    const scaleX = canvas.width / rect.width
+    const scaleY = canvas.height / rect.height
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
+    }
+  }
+
+  const onCanvasMouseDown = (e) => {
+    const p = getCanvasPoint(e)
+    if (!p) return
+    setIsDrawing(true)
+    drawStartRef.current = p
+    setSelection(null)
+  }
+
+  const onCanvasMouseMove = (e) => {
+    if (!isDrawing || !drawStartRef.current) return
+    const p = getCanvasPoint(e)
+    if (!p) return
+    const sx = drawStartRef.current.x
+    const sy = drawStartRef.current.y
+    const x = Math.min(sx, p.x)
+    const y = Math.min(sy, p.y)
+    const w = Math.abs(p.x - sx)
+    const h = Math.abs(p.y - sy)
+    setSelection({ x, y, w, h })
+    drawSelectionRect({ x, y, w, h })
+  }
+
+  const onCanvasMouseUp = () => {
+    setIsDrawing(false)
+    drawStartRef.current = null
+  }
+
+  // 영역이 바뀌면 자동 읽기/OK 다시 시도할 수 있게 플래그 초기화
+  useEffect(() => {
+    autoReadDoneRef.current = false
+    autoOkDoneRef.current = false
+  }, [selection])
+
+  const drawSelectionRect = (sel) => {
+    const canvas = overlayCanvasRef.current
+    if (!canvas || !sel) return
+    const ctx = canvas.getContext('2d')
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    if (sel.w > 0 && sel.h > 0) {
+      ctx.strokeStyle = '#00ff00'
+      ctx.lineWidth = 2
+      ctx.strokeRect(sel.x, sel.y, sel.w, sel.h)
+    }
+  }
+
+  // 선택 영역 그리기 유지
+  useEffect(() => {
+    if (selection && overlayCanvasRef.current) {
+      drawSelectionRect(selection)
+    }
+  }, [selection])
+
+  // EXP 텍스트 + 숫자 + [%] 포함 영역 반환. 저해상도에서도 인식되도록 관대한 조건 + 필요 시 2배 확대 OCR
+  const detectExpRegion = async () => {
+    const snap = snapshotCanvasRef.current
+    const video = videoRef.current
+    if (snap && snap.width > 0 && snap.height > 0) {
+      const cw = snap.width
+      const ch = snap.height
+      const runOcr = (source) =>
+        Tesseract.recognize(source, 'eng', {
+          logger: () => {},
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,[]% ',
+          tessedit_pageseg_mode: 6,
+        }).then((r) => r.data?.words ?? [])
+
+      let words = await runOcr(snap)
+      let scale = 1
+      if (words.length === 0 && (cw < 400 || ch < 60)) {
+        const up = document.createElement('canvas')
+        up.width = cw * 2
+        up.height = ch * 2
+        const ctx = up.getContext('2d')
+        ctx.drawImage(snap, 0, 0, cw, ch, 0, 0, up.width, up.height)
+        words = await runOcr(up)
+        scale = 2
+      }
+
+      const expWord = words.find((w) => /^EXP\.?$/i.test((w.text || '').trim()))
+      if (!expWord?.bbox) return null
+
+      const b = (v) => (typeof v === 'number' ? v / scale : v)
+      const x0 = b(expWord.bbox.x0)
+      const y0 = b(expWord.bbox.y0)
+      const x1 = b(expWord.bbox.x1)
+      const y1 = b(expWord.bbox.y1)
+      let right = x1
+      let top = y0
+      let bottom = y1
+      const expCenterY = (y0 + y1) / 2
+      const lineTolerance = Math.max((y1 - y0) * 2.5, 28)
+      const expLineWords = []
+      for (const w of words) {
+        if (!w.bbox) continue
+        const wx0 = b(w.bbox.x0)
+        const wy0 = b(w.bbox.y0)
+        const wx1 = b(w.bbox.x1)
+        const wy1 = b(w.bbox.y1)
+        const txt = (w.text || '').trim()
+        if (wx0 < x1 - 5) continue
+        if (Math.abs((wy0 + wy1) / 2 - expCenterY) > lineTolerance) continue
+        if (!/[\d\[\]%]/.test(txt)) continue
+        if (!/^[\d,.\[\]%\s]+$/.test(txt)) continue
+        expLineWords.push({ ...w, bbox: { x0: wx0, y0: wy0, x1: wx1, y1: wy1 } })
+      }
+      const percentEndWord = expLineWords.find((w) => (w.text || '').includes(']'))
+      if (percentEndWord?.bbox) {
+        right = percentEndWord.bbox.x1
+        top = Math.min(top, percentEndWord.bbox.y0)
+        bottom = Math.max(bottom, percentEndWord.bbox.y1)
+      } else {
+        for (const w of expLineWords) {
+          if (w.bbox.x1 > right) right = w.bbox.x1
+          top = Math.min(top, w.bbox.y0)
+          bottom = Math.max(bottom, w.bbox.y1)
+        }
+      }
+      for (const w of expLineWords) {
+        if (w.bbox.x1 <= right) {
+          top = Math.min(top, w.bbox.y0)
+          bottom = Math.max(bottom, w.bbox.y1)
+        }
+      }
+      if (percentEndWord == null && expLineWords.length === 0) {
+        right = Math.min(cw - 2, x1 + Math.min(200, Math.floor(cw * 0.5)))
+      }
+      const pad = 6
+      const rx = Math.max(0, x0 - 4)
+      const ry = Math.max(0, top - 4)
+      const rw = Math.min(cw - rx, right - rx + pad)
+      const rh = Math.min(ch - ry, bottom - ry + pad)
+      if (rw < 40 || rh < 8) return null
+      return { x: rx, y: ry, w: rw, h: rh }
+    }
+    if (!video || video.readyState < 2) return null
+    const vw = video.videoWidth
+    const vh = video.videoHeight
+    const cropY = Math.floor(vh * 0.58)
+    const cropH = vh - cropY
+    if (cropH < 40) return null
+    const crop = document.createElement('canvas')
+    crop.width = vw
+    crop.height = cropH
+    crop.getContext('2d').drawImage(video, 0, cropY, vw, cropH, 0, 0, vw, cropH)
+    const { data } = await Tesseract.recognize(crop, 'eng', {
+      logger: () => {},
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,[]% ',
+      tessedit_pageseg_mode: 6,
+    })
+    const words = data?.words ?? []
+    const expWord = words.find((w) => /^EXP\.?$/i.test((w.text || '').trim()))
+    if (!expWord?.bbox) return null
+    const { x0, y0, x1, y1 } = expWord.bbox
+    const pad = 8
+    const rx = Math.min(x1 + pad, vw - 50)
+    const rw = Math.min(450, vw - rx)
+    const ry = Math.max(0, y0 - 4)
+    const rh = Math.min(70, cropH - ry, (y1 - y0) + 24)
+    if (rw < 80 || rh < 15) return null
+    return { x: rx, y: cropY + ry, w: rw, h: rh }
+  }
+
+  const runAutoDetect = async () => {
+    const overlay = overlayCanvasRef.current
+    if (!overlay) return
+    setIsDetecting(true)
+    setError(null)
+    setSelection(null)
+    try {
+      const region = await detectExpRegion()
+      if (region) {
+        const snap = snapshotCanvasRef.current
+        if (snap && snap.width > 0) {
+          setSelection(region)
+        } else {
+          const video = videoRef.current
+          if (video) {
+            const vw = video.videoWidth
+            const vh = video.videoHeight
+            const dw = overlay.width
+            const dh = overlay.height
+            setSelection({
+              x: (region.x / vw) * dw,
+              y: (region.y / vh) * dh,
+              w: (region.w / vw) * dw,
+              h: (region.h / vh) * dh,
+            })
+          }
+        }
+      } else {
+        setError('현재 해상도로는 경험치 영역을 찾기 어렵습니다. 아래에서 영역을 수동으로 드래그해 지정해 주세요.')
+      }
+    } finally {
+      setIsDetecting(false)
+    }
+  }
+
+  // 4번: 선택 영역만 캡처 후 OCR
+  const captureAndOcr = async () => {
+    const video = videoRef.current
+    const snapshotCanvas = snapshotCanvasRef.current
+    if (!video || !selection || selection.w < 5 || selection.h < 5) return null
+
+    let crop
+    let sw, sh
+
+    if (!isRunning && snapshotCanvas && snapshotCanvas.width > 0) {
+      // 영역 지정 단계: 사용자가 그린 스냅샷 캔버스에서 바로 잘라서 고화질 유지
+      const sx = Math.max(0, Math.floor(selection.x))
+      const sy = Math.max(0, Math.floor(selection.y))
+      sw = Math.min(snapshotCanvas.width - sx, Math.ceil(selection.w))
+      sh = Math.min(snapshotCanvas.height - sy, Math.ceil(selection.h))
+      if (sw < 5 || sh < 5) return null
+      crop = document.createElement('canvas')
+      crop.width = sw
+      crop.height = sh
+      crop.getContext('2d').drawImage(snapshotCanvas, sx, sy, sw, sh, 0, 0, sw, sh)
+    } else {
+      // 측정 중: ROI만 직접 캡처 (aprud.me cropRegion 스타일) + 캔버스 캐시 재사용
+      const rect = selectionVideoRef.current
+      if (!rect || rect.w < 5 || rect.h < 5) return null
+
+      const sx = Math.max(0, Math.floor(rect.x))
+      const sy = Math.max(0, Math.floor(rect.y))
+      sw = Math.ceil(rect.w)
+      sh = Math.ceil(rect.h)
+      if (sw < 5 || sh < 5) return null
+
+      const cacheKey = `exp_${sw}_${sh}`
+      let cached = cropCanvasCacheRef.current.get(cacheKey)
+      if (!cached || !cached.canvas) {
+        cached = {
+          canvas: document.createElement('canvas'),
+          ctx: null,
+        }
+        cached.canvas.width = sw
+        cached.canvas.height = sh
+        cached.ctx = cached.canvas.getContext('2d')
+        cropCanvasCacheRef.current.set(cacheKey, cached)
+      }
+
+      const stream = video.srcObject
+      if (stream && typeof ImageCapture !== 'undefined') {
+        const track = stream.getVideoTracks()[0]
+        if (track) {
+          try {
+            const imageCapture = new ImageCapture(track)
+            const bitmap = await imageCapture.grabFrame()
+            const vw = bitmap.width
+            const vh = bitmap.height
+            if (vw >= 10 && vh >= 10) {
+              const clipSx = Math.min(sx, vw - 5)
+              const clipSy = Math.min(sy, vh - 5)
+              const clipW = Math.min(sw, vw - clipSx)
+              const clipH = Math.min(sh, vh - clipSy)
+              if (clipW >= 5 && clipH >= 5) {
+                cached.ctx.drawImage(bitmap, clipSx, clipSy, clipW, clipH, 0, 0, clipW, clipH)
+                crop = cached.canvas
+                sw = clipW
+                sh = clipH
+              }
+            }
+            bitmap.close()
+          } catch (_) {}
+        }
+      }
+
+      if (!crop && video.videoWidth >= 10 && video.videoHeight >= 10) {
+        const vw = video.videoWidth
+        const vh = video.videoHeight
+        const clipW = Math.min(sw, vw - sx)
+        const clipH = Math.min(sh, vh - sy)
+        if (clipW >= 5 && clipH >= 5) {
+          cached.ctx.drawImage(video, sx, sy, clipW, clipH, 0, 0, clipW, clipH)
+          crop = cached.canvas
+          sw = clipW
+          sh = clipH
+        }
+      }
+      if (!crop) return null
+    }
+
+    // 2) OCR 입력: 화질이 너무 낮으면 인식 실패하므로 최대 400px까지 유지
+    const MAX_OCR_PX = 400
+    let src = crop
+    if (sw > MAX_OCR_PX || sh > MAX_OCR_PX) {
+      const r = Math.min(MAX_OCR_PX / sw, MAX_OCR_PX / sh)
+      const smallW = Math.round(sw * r)
+      const smallH = Math.round(sh * r)
+      const small = document.createElement('canvas')
+      small.width = smallW
+      small.height = smallH
+      small.getContext('2d').drawImage(crop, 0, 0, sw, sh, 0, 0, smallW, smallH)
+      src = small
+    }
+
+    const { data: { text } } = await Tesseract.recognize(src, 'eng', {
+      logger: () => {},
+      tessedit_char_whitelist: '0123456789.,[]%',
+      tessedit_pageseg_mode: 7, // PSM 7 = 한 줄, 인식 속도 향상
+    })
+    return parseExpAndPercent(text)
+  }
+
+  const readExp = async () => {
+    if (!selection) return
+    setIsReading(true)
+    setCurrentExp(null)
+    setCurrentExpPercent(null)
+    setError(null)
+    try {
+      const result = await captureAndOcr()
+      if (result && (result.exp != null || result.percent != null)) {
+        setCurrentExp(result.exp)
+        setCurrentExpPercent(result.percent)
+      } else {
+        setError('경험치를 읽지 못했습니다. 영역을 다시 넓게 지정하거나, 다시 캡처 후 시도해 주세요.')
+      }
+    } finally {
+      setIsReading(false)
+    }
+  }
+
+  // 스냅샷 단계에서 영역이 있고 아직 값이 없으면 자동으로 한 번 읽기
+  useEffect(() => {
+    if (!showSnapshot || !selection || currentExp !== null || isReading) return
+    if (!autoFlowRef.current) return
+    if (autoReadDoneRef.current) return
+    autoReadDoneRef.current = true
+    readExp()
+  }, [showSnapshot, selection, currentExp, isReading])
+
+  const onOk = () => {
+    if (currentExp === null) return
+    setConfirmedExp(currentExp)
+    setShowStart(true)
+    setShowSnapshot(false)
+  }
+
+  // 값이 읽힌 뒤에는 자동으로 측정 준비 단계까지 넘기기 (OK 자동)
+  useEffect(() => {
+    if (!showSnapshot) return
+    if (currentExp === null || showStart) return
+    if (!autoFlowRef.current) return
+    if (autoOkDoneRef.current) return
+    autoOkDoneRef.current = true
+    onOk()
+    autoFlowRef.current = false
+  }, [currentExp, showSnapshot, showStart])
+
+  const startSilentAudio = () => {
+    if (silentAudioRef.current) return
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext
+      if (!Ctx) return
+      const ctx = new Ctx()
+      const buf = ctx.createBuffer(1, ctx.sampleRate * 0.1, ctx.sampleRate)
+      const src = ctx.createBufferSource()
+      src.buffer = buf
+      src.loop = true
+      src.connect(ctx.destination)
+      src.start(0)
+      silentAudioRef.current = { ctx, src }
+    } catch (_) {}
+  }
+
+  const stopSilentAudio = () => {
+    const ref = silentAudioRef.current
+    if (!ref) return
+    try {
+      ref.src.stop()
+      ref.ctx.close()
+    } catch (_) {}
+    silentAudioRef.current = null
+  }
+
+  const onStart = () => {
+    const cap = captureCropRef.current
+    const snapDim = snapshotDimensionsRef.current
+    if (snapDim) {
+      captureDisplaySizeRef.current = { w: snapDim.w, h: snapDim.h }
+    } else if (overlayCanvasRef.current?.width > 0) {
+      captureDisplaySizeRef.current = { w: overlayCanvasRef.current.width, h: overlayCanvasRef.current.height }
+    }
+    // 측정 중에는 이 비디오 픽셀 영역만 OCR — 스냅샷 좌표를 여기서 한 번만 변환
+    if (selection && cap && snapDim && snapDim.w >= 10 && snapDim.h >= 10) {
+      const scaleX = cap.w / snapDim.w
+      const scaleY = cap.h / snapDim.h
+      selectionVideoRef.current = {
+        x: cap.x + selection.x * scaleX,
+        y: cap.y + selection.y * scaleY,
+        w: selection.w * scaleX,
+        h: selection.h * scaleY,
+      }
+    } else {
+      selectionVideoRef.current = null
+    }
+    startSilentAudio()
+    setStartTime(Date.now())
+    setStartExp(confirmedExp)
+    setIsRunning(true)
+    setElapsedSec(0)
+    setExpGained(0)
+    setExpPerHour(0)
+
+    const tick = () => {
+      setElapsedSec((s) => s + 1)
+    }
+    timerRef.current = setInterval(tick, 1000)
+
+    const applyOcrResult = (result) => {
+      if (!result) return
+      if (result.exp != null && result.exp !== lastOcrResultRef.current.exp) {
+        lastOcrResultRef.current.exp = result.exp
+        setCurrentExp(result.exp)
+      }
+      if (result.percent !== lastOcrResultRef.current.percent) {
+        lastOcrResultRef.current.percent = result.percent
+        setCurrentExpPercent(result.percent)
+      }
+    }
+
+    const ocrLoop = async () => {
+      if (!ocrLoopRunningRef.current) return
+      const now = performance.now()
+      if (!ocrInFlightRef.current && now - lastOcrTimeRef.current >= 1000) {
+        ocrInFlightRef.current = true
+        lastOcrTimeRef.current = now
+        try {
+          const result = await captureAndOcr()
+          applyOcrResult(result)
+        } finally {
+          ocrInFlightRef.current = false
+        }
+      }
+      if (videoRef.current?.requestVideoFrameCallback) {
+        ocrRafIdRef.current = videoRef.current.requestVideoFrameCallback(ocrLoop)
+      }
+    }
+
+    ocrLoopRunningRef.current = true
+    lastOcrTimeRef.current = 0
+    ocrInFlightRef.current = false
+    if (videoRef.current?.requestVideoFrameCallback) {
+      ocrRafIdRef.current = videoRef.current.requestVideoFrameCallback(ocrLoop)
+    } else {
+      const ocrInterval = async () => {
+        if (!ocrLoopRunningRef.current || ocrInFlightRef.current) return
+        ocrInFlightRef.current = true
+        try {
+          const result = await captureAndOcr()
+          applyOcrResult(result)
+        } finally {
+          ocrInFlightRef.current = false
+        }
+      }
+      ocrInterval()
+      intervalRef.current = setInterval(ocrInterval, 1000)
+    }
+  }
+
+  const onStop = () => {
+    stopSilentAudio()
+    if (pipUpdateIntervalRef.current) {
+      clearInterval(pipUpdateIntervalRef.current)
+      pipUpdateIntervalRef.current = null
+    }
+    if (pipWindowRef.current && !pipWindowRef.current.closed) {
+      pipWindowRef.current.close()
+      pipWindowRef.current = null
+    }
+    setIsRunning(false)
+    if (intervalRef.current) clearInterval(intervalRef.current)
+    if (timerRef.current) clearInterval(timerRef.current)
+    if (ocrRafIdRef.current && videoRef.current?.cancelVideoFrameCallback) {
+      videoRef.current.cancelVideoFrameCallback(ocrRafIdRef.current)
+      ocrRafIdRef.current = null
+    }
+    ocrLoopRunningRef.current = false
+    autoReadDoneRef.current = false
+    autoOkDoneRef.current = false
+    autoFlowRef.current = false
+  }
+
+  // 화면 공유·영역은 유지한 채 측정만 처음부터 다시 시작
+  const resetMeasurement = () => {
+    stopSilentAudio()
+    if (intervalRef.current) clearInterval(intervalRef.current)
+    if (timerRef.current) clearInterval(timerRef.current)
+    setIsRunning(false)
+    setStartTime(null)
+    setStartExp(null)
+    setElapsedSec(0)
+    setExpGained(0)
+    setExpPerHour(0)
+    setMilestoneExp({ 60: null, 120: null, 180: null, 300: null })
+    setCurrentExp(null)
+    setCurrentExpPercent(null)
+    setConfirmedExp(null)
+    autoReadDoneRef.current = false
+    autoOkDoneRef.current = false
+    autoFlowRef.current = true
+    setShowStart(false)
+    setShowSnapshot(true)
+  }
+
+  const formatTimeForPip = (sec) => {
+    const h = Math.floor(sec / 3600)
+    const m = Math.floor((sec % 3600) / 60)
+    const s = sec % 60
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    return `${m}:${String(s).padStart(2, '0')}`
+  }
+
+  const openPip = async () => {
+    if (pipWindowRef.current && !pipWindowRef.current.closed) return
+    let win
+    try {
+      if (window.documentPictureInPicture) {
+        win = await window.documentPictureInPicture.requestWindow({ width: 320, height: 420 })
+      } else {
+        win = window.open('', 'exp-tracker-pip', 'width=320,height=420,left=100,top=100')
+        if (!win) {
+          setError('PIP 창을 열 수 없습니다. 팝업 차단을 해제해 주세요.')
+          return
+        }
+      }
+    } catch (e) {
+      win = window.open('', 'exp-tracker-pip', 'width=320,height=420,left=100,top=100')
+      if (!win) {
+        setError('PIP 창을 열 수 없습니다. 팝업 차단을 해제해 주세요.')
+        return
+      }
+    }
+    pipWindowRef.current = win
+    win.document.title = '경험치 트래커'
+    const stepLabels = ['', '화면 공유', '영역 선택', '경험치 읽기', '값 확인', '측정 준비', '측정 중']
+    win.document.body.innerHTML = `
+      <style>
+        #pip-root {
+          font-family: system-ui, sans-serif;
+          padding: 12px;
+          background: #0f172a;
+          color: #e2e8f0;
+          min-height: 100%;
+          box-sizing: border-box;
+        }
+        .pip-milestones {
+          display: grid;
+          grid-template-columns: repeat(2, 1fr);
+          gap: 4px;
+          margin-top: 6px;
+        }
+        .pip-milestone {
+          padding: 4px 6px;
+          border-radius: 6px;
+          border: 1px solid rgba(127, 29, 29, 0.9);
+          background: rgba(127, 29, 29, 0.65);
+          font-size: 11px;
+        }
+        .pip-milestone-label {
+          display: block;
+          color: #fecaca;
+          margin-bottom: 2px;
+        }
+        .pip-milestone-value {
+          display: block;
+          color: #fee2e2;
+          font-weight: 600;
+        }
+        .pip-milestone--passed {
+          border-color: #4ade80;
+          background: rgba(22, 163, 74, 0.4);
+          box-shadow:
+            0 0 8px rgba(74, 222, 128, 0.6),
+            0 0 14px rgba(22, 163, 74, 0.45);
+        }
+        .pip-milestone--pre {
+          border-color: #fbbf24;
+          animation: pip-milestone-pre 0.8s ease-in-out infinite alternate;
+        }
+        @keyframes pip-milestone-pre {
+          from {
+            box-shadow:
+              0 0 4px rgba(250, 191, 36, 0.4),
+              0 0 10px rgba(250, 204, 21, 0.3);
+          }
+          to {
+            box-shadow:
+              0 0 14px rgba(250, 204, 21, 0.85),
+              0 0 20px rgba(250, 250, 150, 0.6);
+          }
+        }
+      </style>
+      <div id="pip-root">
+        <div id="pip-step-panel">
+          <div style="font-weight:700;margin-bottom:6px;" id="pip-step-label">영역 선택</div>
+          <div style="font-size:12px;color:#94a3b8;margin-bottom:12px;" id="pip-hint"></div>
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <button type="button" id="pip-btn-read" style="padding:8px 12px;background:#1e3a5f;color:#fff;border:none;border-radius:6px;cursor:pointer;">경험치 읽기</button>
+            <button type="button" id="pip-btn-ok" style="padding:8px 12px;background:#1e3a5f;color:#fff;border:none;border-radius:6px;cursor:pointer;">이 값으로 준비</button>
+            <button type="button" id="pip-btn-start" style="padding:8px 12px;background:#166534;color:#fff;border:none;border-radius:6px;cursor:pointer;">측정 시작</button>
+          </div>
+        </div>
+        <div id="pip-stats" style="display:none;">
+          <div style="font-weight:700;margin-bottom:10px;">⚡ 경험치 측정</div>
+          <div id="pip-elapsed" style="margin-bottom:6px;">경과: 0:00</div>
+          <div id="pip-exp" style="margin-bottom:6px;">현재: -</div>
+          <div id="pip-gained" style="margin-bottom:6px;">획득: -</div>
+          <div id="pip-per-hour" style="margin-bottom:12px;font-weight:600;color:#86efac;">EXP/h: -</div>
+          <div class="pip-milestones">
+            <div id="pip-m-60" class="pip-milestone">
+              <span id="pip-m-60-label" class="pip-milestone-label">1분 예상</span>
+              <span id="pip-m-60-value" class="pip-milestone-value">-</span>
+            </div>
+            <div id="pip-m-120" class="pip-milestone">
+              <span id="pip-m-120-label" class="pip-milestone-label">2분 예상</span>
+              <span id="pip-m-120-value" class="pip-milestone-value">-</span>
+            </div>
+            <div id="pip-m-180" class="pip-milestone">
+              <span id="pip-m-180-label" class="pip-milestone-label">3분 예상</span>
+              <span id="pip-m-180-value" class="pip-milestone-value">-</span>
+            </div>
+            <div id="pip-m-300" class="pip-milestone">
+              <span id="pip-m-300-label" class="pip-milestone-label">5분 예상</span>
+              <span id="pip-m-300-value" class="pip-milestone-value">-</span>
+            </div>
+          </div>
+          <div id="pip-next" style="font-size:12px;color:#94a3b8;margin-top:6px;">다음 60초 예상: -</div>
+        </div>
+      </div>
+    `
+    win.document.getElementById('pip-btn-read').onclick = () => win.opener?.postMessage({ type: 'EXP_TRACKER_ACTION', action: 'READ_EXP' }, '*')
+    win.document.getElementById('pip-btn-ok').onclick = () => win.opener?.postMessage({ type: 'EXP_TRACKER_ACTION', action: 'OK' }, '*')
+    win.document.getElementById('pip-btn-start').onclick = () => win.opener?.postMessage({ type: 'EXP_TRACKER_ACTION', action: 'START' }, '*')
+
+    const updatePipContent = () => {
+      if (!pipWindowRef.current || pipWindowRef.current.closed) {
+        if (pipUpdateIntervalRef.current) clearInterval(pipUpdateIntervalRef.current)
+        pipUpdateIntervalRef.current = null
+        return
+      }
+      const doc = pipWindowRef.current.document
+      const ps = pipStateRef.current
+      const stepPanel = doc.getElementById('pip-step-panel')
+      const statsPanel = doc.getElementById('pip-stats')
+      if (ps.isRunning) {
+        if (stepPanel) stepPanel.style.display = 'none'
+        if (statsPanel) statsPanel.style.display = 'block'
+        const s = latestStatsRef.current
+        const expPerHour = s.expPerHour ?? 0
+        if (doc.getElementById('pip-elapsed')) doc.getElementById('pip-elapsed').textContent = `경과: ${formatTimeForPip(s.elapsedSec ?? 0)}`
+        if (doc.getElementById('pip-exp')) doc.getElementById('pip-exp').textContent = `현재: ${s.currentExp != null ? s.currentExp.toLocaleString() : '-'}${s.currentExpPercent != null ? ` [${s.currentExpPercent}%]` : ''}`
+        if (doc.getElementById('pip-gained')) doc.getElementById('pip-gained').textContent = `획득: ${(s.expGained ?? 0).toLocaleString()}`
+        if (doc.getElementById('pip-per-hour')) doc.getElementById('pip-per-hour').textContent = `EXP/h: ${expPerHour.toLocaleString()}`
+        const checkpoints = [60, 120, 180, 300]
+        const elapsed = s.elapsedSec ?? 0
+        const secLabel = { 60: '1분', 120: '2분', 180: '3분', 300: '5분' }
+        checkpoints.forEach((sec) => {
+          const box = doc.getElementById(`pip-m-${sec}`)
+          const labelEl = doc.getElementById(`pip-m-${sec}-label`)
+          const valueEl = doc.getElementById(`pip-m-${sec}-value`)
+          if (!box || !labelEl || !valueEl) return
+          const passed = elapsed >= sec
+          const pre = !passed && elapsed >= sec - 3
+          box.className = `pip-milestone${passed ? ' pip-milestone--passed' : ''}${pre ? ' pip-milestone--pre' : ''}`
+          labelEl.textContent = passed ? `${secLabel[sec] || `${sec}초`} 완료` : `${secLabel[sec] || `${sec}초`} 예상`
+          const val = Math.round((expPerHour * sec) / 3600)
+          valueEl.textContent = Number.isFinite(val) ? `${val.toLocaleString()} EXP` : '-'
+        })
+        const nextLabel = doc.getElementById('pip-next')
+        if (nextLabel) {
+          const next = checkpoints.find((sec) => elapsed < sec)
+          if (!next) {
+            nextLabel.textContent = '다음 구간 없음'
+          } else {
+            const value = Math.round((expPerHour * next) / 3600).toLocaleString()
+            nextLabel.textContent = `다음 ${secLabel[next] || `${next}초`} 예상: ${value} EXP`
+          }
+        }
+      } else {
+        if (stepPanel) stepPanel.style.display = 'block'
+        if (statsPanel) statsPanel.style.display = 'none'
+        const stepNum = { 1: '①', 2: '②', 3: '③', 4: '④', 5: '⑤', 6: '⑥' }
+        if (doc.getElementById('pip-step-label')) doc.getElementById('pip-step-label').textContent = `${stepNum[ps.step] || ''} ${stepLabels[ps.step] || ''}`
+        if (doc.getElementById('pip-hint')) doc.getElementById('pip-hint').textContent = ps.hint || ''
+        const br = doc.getElementById('pip-btn-read')
+        const bo = doc.getElementById('pip-btn-ok')
+        const bs = doc.getElementById('pip-btn-start')
+        if (br) { br.disabled = !ps.canReadExp; br.textContent = ps.canReadExp ? '경험치 읽기' : '영역 지정 후 가능' }
+        if (bo) { bo.disabled = !ps.canOk; bo.style.display = ps.canOk ? 'block' : 'none' }
+        if (bs) { bs.disabled = !ps.canStart; bs.style.display = ps.canStart ? 'block' : 'none' }
+      }
+    }
+    updatePipContent()
+    pipUpdateIntervalRef.current = setInterval(updatePipContent, 500)
+    win.addEventListener('pagehide', () => {
+      if (pipUpdateIntervalRef.current) clearInterval(pipUpdateIntervalRef.current)
+      pipUpdateIntervalRef.current = null
+      pipWindowRef.current = null
+    })
+  }
+
+  // 실시간 경험치/EXP per hour 갱신 (isRunning일 때 currentExp가 바뀔 때마다)
+  useEffect(() => {
+    if (!isRunning || startTime == null || startExp == null || currentExp == null) return
+    setExpGained(currentExp - startExp)
+    const sec = elapsedSec || 1
+    setExpPerHour(Math.round((currentExp - startExp) / (sec / 3600)))
+  }, [isRunning, startTime, startExp, currentExp, elapsedSec])
+
+  // 마일스톤(1/2/3/5분) 예상 EXP 스냅샷 고정
+  useEffect(() => {
+    if (!isRunning) {
+      setMilestoneExp({ 60: null, 120: null, 180: null, 300: null })
+      return
+    }
+    const secs = [60, 120, 180, 300]
+    setMilestoneExp((prev) => {
+      const next = { ...prev }
+      let changed = false
+      secs.forEach((s) => {
+        if (elapsedSec >= s && next[s] == null) {
+          // expPerHour 기준, s초 동안의 예상 EXP
+          next[s] = Math.round((expPerHour * s) / 3600)
+          changed = true
+        }
+      })
+      return changed ? next : prev
+    })
+  }, [isRunning, elapsedSec, expPerHour])
+
+  // PIP 창 갱신용: 측정 중일 때 최신 수치를 ref에 동기화
+  useEffect(() => {
+    if (!isRunning) return
+    const expPerHourVal = elapsedSec >= 1 && startExp != null && currentExp != null
+      ? Math.round((currentExp - startExp) / (elapsedSec / 3600))
+      : 0
+    latestStatsRef.current = {
+      elapsedSec,
+      startExp,
+      currentExp,
+      currentExpPercent: currentExpPercent ?? null,
+      expGained: startExp != null && currentExp != null ? currentExp - startExp : 0,
+      expPerHour: expPerHourVal,
+    }
+  }, [isRunning, elapsedSec, startExp, currentExp, currentExpPercent])
+
+  const pipActionRef = useRef({ readExp, onOk, onStart })
+  pipActionRef.current = { readExp, onOk, onStart }
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.data?.type !== 'EXP_TRACKER_ACTION') return
+      const { readExp: r, onOk: o, onStart: s } = pipActionRef.current
+      if (e.data.action === 'READ_EXP') r()
+      else if (e.data.action === 'OK') o()
+      else if (e.data.action === 'START') s()
+    }
+    window.addEventListener('message', handler)
+    return () => window.removeEventListener('message', handler)
+  }, [])
+
+  // PIP에 전달할 단계/버튼 상태 동기화 (스냅샷·START 전에도 PIP에서 조작 가능하게)
+  useEffect(() => {
+    const s = !stream ? 1 : isRunning ? 6 : showStart ? 5 : currentExp !== null && !showStart ? 4 : showSnapshot && selection ? 3 : 2
+    const hints = {
+      1: 'STEP 1 · 화면 공유',
+      2: 'STEP 2 · 경험치 바 선택',
+      3: 'STEP 3 · 값 읽기',
+      4: 'STEP 3 · 값 확인',
+      5: 'STEP 4 · 측정 준비',
+      6: 'STEP 4 · 측정 중',
+    }
+    const hint = s === 2 && !selection ? '경험치 영역 찾는 중…' : (hints[s] || '')
+    pipStateRef.current = {
+      step: s,
+      hint,
+      canReadExp: !!stream && !!showSnapshot && !!selection && selection.w >= 5 && selection.h >= 5 && !isReading,
+      canOk: currentExp !== null && !showStart,
+      canStart: showStart && !isRunning && confirmedExp != null,
+      currentExp,
+      confirmedExp,
+      isRunning,
+      elapsedSec: latestStatsRef.current.elapsedSec ?? 0,
+      expPerHour: latestStatsRef.current.expPerHour ?? 0,
+      expGained: latestStatsRef.current.expGained ?? 0,
+    }
+  }, [stream, showSnapshot, showStart, selection, currentExp, confirmedExp, isRunning, isReading])
+
+  const formatTime = (sec) => {
+    const h = Math.floor(sec / 3600)
+    const m = Math.floor((sec % 3600) / 60)
+    const s = sec % 60
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    return `${m}:${String(s).padStart(2, '0')}`
+  }
+
+  // 단계: 1 화면 공유 → 2 영역 확인 → 3 경험치 읽기 → 4 확인(OK) → 5 START → 6 측정 중
+  const getStep = () => {
+    if (!stream) return 1
+    if (isRunning) return 6
+    if (showStart) return 5
+    if (currentExp !== null && !showStart) return 4
+    if (showSnapshot && selection && (currentExp === null || isReading)) return 3
+    if (showSnapshot) return 2
+    return 2
+  }
+  const step = getStep()
+  const STEP_LABELS = ['', '화면 공유', '영역 선택', '경험치 읽기', '값 확인', '측정 준비', '측정 중']
+  const STEP_HINTS = {
+    1: 'STEP 1 · 화면 공유',
+    2: 'STEP 2 · 경험치 바 선택',
+    3: 'STEP 3 · 값 읽기',
+    4: 'STEP 3 · 값 확인',
+    5: 'STEP 4 · 측정 준비',
+    6: 'STEP 4 · 측정 중',
+  }
+
+  // 마일스톤 구간별(60→120, 120→180, 180→300) 분당 효율 증감률(%) 계산
+  const milestoneDurations = { 60: 60, 120: 120, 180: 180, 300: 300 }
+  const getMilestoneDelta = (currentKey, prevKey) => {
+    const cur = milestoneExp[currentKey]
+    const prev = milestoneExp[prevKey]
+    if (cur == null || prev == null || prev <= 0) return null
+    const curPer = cur / milestoneDurations[currentKey]
+    const prevPer = prev / milestoneDurations[prevKey]
+    if (!Number.isFinite(curPer) || !Number.isFinite(prevPer) || prevPer === 0) return null
+    const diff = (curPer / prevPer - 1) * 100
+    if (!Number.isFinite(diff)) return null
+    return Math.round(diff)
+  }
+
+  if (!stream) {
+    return (
+      <section className="exp-tracker">
+        <h2>경험치 트래커</h2>
+        <p className="exp-tracker-desc">화면을 공유하고 몇 번만 클릭하면 시간당 EXP를 자동으로 계산합니다.</p>
+        {error && <p className="exp-tracker-error">{error}</p>}
+        <button type="button" className="exp-tracker-btn primary" onClick={startScreenShare}>
+          화면 공유 시작
+        </button>
+      </section>
+    )
+  }
+
+  return (
+    <section className="exp-tracker">
+      <h2>경험치 트래커</h2>
+      {/* 공유 화면: 기본 숨김. 측정 중엔 2px만 보이게 해서 디코딩 유지(OCR 동작). 캡처 시엔 잠깐 표시 */}
+      <div
+        className={`exp-tracker-video-wrap${videoVisibleForCapture ? ' exp-tracker-video-wrap--capturing' : ''}${isRunning ? ' exp-tracker-video-wrap--measuring' : ''}`}
+        aria-hidden
+      >
+        <video ref={videoRef} autoPlay muted playsInline />
+      </div>
+
+      {error && <p className="exp-tracker-error">{error}</p>}
+
+      <div className="exp-tracker-stepper" aria-label="진행 단계">
+        {[2, 3, 4, 5, 6].map((i) => (
+          <span
+            key={i}
+            className={`exp-tracker-step${step >= i ? ' exp-tracker-step--active' : ''}${step === i ? ' exp-tracker-step--current' : ''}`}
+          >
+            {i === 2 && '② '}
+            {i === 3 && '③ '}
+            {i === 4 && '④ '}
+            {i === 5 && '⑤ '}
+            {i === 6 && '⑥ '}
+            {STEP_LABELS[i]}
+          </span>
+        ))}
+      </div>
+      <p className="exp-tracker-hint exp-tracker-step-hint">
+        {step === 2 && !selection ? '경험치 영역 찾는 중…' : STEP_HINTS[step]}
+      </p>
+
+      {showSnapshot && (
+        <>
+          <div className="exp-tracker-snapshot-wrap">
+            <canvas ref={snapshotCanvasRef} className="exp-tracker-snapshot" />
+            <canvas
+              ref={overlayCanvasRef}
+              className="exp-tracker-overlay"
+              onMouseDown={onCanvasMouseDown}
+              onMouseMove={onCanvasMouseMove}
+              onMouseUp={onCanvasMouseUp}
+              onMouseLeave={onCanvasMouseUp}
+            />
+          </div>
+          <div className="exp-tracker-actions exp-tracker-actions--primary">
+            {currentExp === null ? (
+              <button
+                type="button"
+                className="exp-tracker-btn primary exp-tracker-btn--main"
+                onClick={readExp}
+                disabled={!selection || selection.w < 5 || selection.h < 5 || isReading}
+              >
+                {isReading ? '읽는 중…' : '경험치 읽기'}
+              </button>
+            ) : (
+              <>
+                <span className="exp-tracker-current">
+                  현재 경험치: {currentExp.toLocaleString()}
+                  {currentExpPercent != null && ` [${currentExpPercent}%]`}
+                </span>
+                <button type="button" className="exp-tracker-btn primary exp-tracker-btn--main" onClick={onOk}>
+                  이 값으로 측정 준비
+                </button>
+              </>
+            )}
+          </div>
+          <div className="exp-tracker-actions exp-tracker-actions--secondary">
+            <button type="button" className="exp-tracker-btn secondary" onClick={openPip} title="작은 창에서도 조작 가능">
+              📺 PIP 열기
+            </button>
+            <button
+              type="button"
+              className="exp-tracker-btn secondary"
+              onClick={() => { setShowSnapshot(false); setSelection(null); setTimeout(() => setShowSnapshot(true), 150) }}
+            >
+              다시 캡처
+            </button>
+            <button type="button" className="exp-tracker-btn secondary" onClick={runAutoDetect} disabled={isDetecting}>
+              {isDetecting ? '찾는 중…' : '영역 다시 찾기'}
+            </button>
+            <button type="button" className="exp-tracker-btn secondary" onClick={stopScreenShare}>
+              화면 공유 중지
+            </button>
+          </div>
+        </>
+      )}
+
+      {!showSnapshot && !showStart && <p className="exp-tracker-hint">캡처 중…</p>}
+
+      {!showSnapshot && showStart && (
+        <>
+          <div className="exp-tracker-actions exp-tracker-actions--primary">
+            {!isRunning && (
+              <button type="button" className="exp-tracker-btn primary exp-tracker-btn--main exp-tracker-btn--start" onClick={onStart}>
+                ▶ 지금부터 측정 시작
+              </button>
+            )}
+            <span className="exp-tracker-current">시작 경험치: {confirmedExp?.toLocaleString() ?? '-'}</span>
+          </div>
+          <div className="exp-tracker-actions exp-tracker-actions--secondary">
+            <button type="button" className="exp-tracker-btn secondary" onClick={openPip} title="작은 창에서도 조작 가능">
+              📺 PIP 열기
+            </button>
+            {!isRunning && (
+              <button type="button" className="exp-tracker-btn danger" onClick={resetMeasurement}>
+                처음부터 다시 측정
+              </button>
+            )}
+            {isRunning && (
+              <button type="button" className="exp-tracker-btn danger" onClick={onStop}>
+                중지
+              </button>
+            )}
+            <button type="button" className="exp-tracker-btn secondary" onClick={stopScreenShare}>
+              화면 공유 중지
+            </button>
+          </div>
+        </>
+      )}
+
+      {isRunning && (
+        <div className="exp-tracker-stats">
+          <p className="exp-tracker-cheer">현재 세션 요약</p>
+          <div className="exp-tracker-stats-row">
+            {startExp != null && (
+              <span>시작 경험치: {startExp.toLocaleString()}</span>
+            )}
+            <span>현재 경험치: {currentExp?.toLocaleString() ?? '-'}{currentExpPercent != null ? ` [${currentExpPercent}%]` : ''}</span>
+          </div>
+          <div>경과 시간: {formatTime(elapsedSec)}</div>
+          <div>획득 경험치: {expGained.toLocaleString()}</div>
+          <div className="exp-tracker-exp-per-hour">시간당 경험치: {expPerHour.toLocaleString()} EXP/h</div>
+
+          <div className="exp-tracker-milestones">
+            <div
+              className={`exp-tracker-milestone${
+                elapsedSec >= 60 ? ' exp-tracker-milestone--passed' : elapsedSec >= 60 - 3 ? ' exp-tracker-milestone--pre' : ''
+              }`}
+            >
+              <span className="exp-tracker-milestone-label">{milestoneExp[60] != null ? '1분 완료' : '1분 예상'}</span>
+              <span className="exp-tracker-milestone-value">
+                {(milestoneExp[60] != null
+                  ? milestoneExp[60]
+                  : Math.round((expPerHour * 60) / 3600)
+                ).toLocaleString()} EXP
+              </span>
+            </div>
+            <div
+              className={`exp-tracker-milestone${
+                elapsedSec >= 120 ? ' exp-tracker-milestone--passed' : elapsedSec >= 120 - 3 ? ' exp-tracker-milestone--pre' : ''
+              }`}
+            >
+              <span className="exp-tracker-milestone-label">{milestoneExp[120] != null ? '2분 완료' : '2분 예상'}</span>
+              <span className="exp-tracker-milestone-value">
+                {(() => {
+                  const base = (milestoneExp[120] != null
+                    ? milestoneExp[120]
+                    : Math.round((expPerHour * 120) / 3600))
+                  const delta = getMilestoneDelta(120, 60)
+                  const deltaText = delta != null ? ` (${delta >= 0 ? '+' : ''}${delta}%)` : ''
+                  return `${base.toLocaleString()} EXP${deltaText}`
+                })()}
+              </span>
+            </div>
+            <div
+              className={`exp-tracker-milestone${
+                elapsedSec >= 180 ? ' exp-tracker-milestone--passed' : elapsedSec >= 180 - 3 ? ' exp-tracker-milestone--pre' : ''
+              }`}
+            >
+              <span className="exp-tracker-milestone-label">{milestoneExp[180] != null ? '3분 완료' : '3분 예상'}</span>
+              <span className="exp-tracker-milestone-value">
+                {(() => {
+                  const base = (milestoneExp[180] != null
+                    ? milestoneExp[180]
+                    : Math.round((expPerHour * 180) / 3600))
+                  const delta = getMilestoneDelta(180, 120)
+                  const deltaText = delta != null ? ` (${delta >= 0 ? '+' : ''}${delta}%)` : ''
+                  return `${base.toLocaleString()} EXP${deltaText}`
+                })()}
+              </span>
+            </div>
+            <div
+              className={`exp-tracker-milestone${
+                elapsedSec >= 300 ? ' exp-tracker-milestone--passed' : elapsedSec >= 300 - 3 ? ' exp-tracker-milestone--pre' : ''
+              }`}
+            >
+              <span className="exp-tracker-milestone-label">{milestoneExp[300] != null ? '5분 완료' : '5분 예상'}</span>
+              <span className="exp-tracker-milestone-value">
+                {(() => {
+                  const base = (milestoneExp[300] != null ? milestoneExp[300] : Math.round((expPerHour * 300) / 3600))
+                  const delta = getMilestoneDelta(300, 180)
+                  const deltaText = delta != null ? ` (${delta >= 0 ? '+' : ''}${delta}%)` : ''
+                  return `${base.toLocaleString()} EXP${deltaText}`
+                })()}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+export default ExpTracker
