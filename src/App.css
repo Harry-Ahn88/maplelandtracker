@@ -81,6 +81,32 @@
   color: #f87171;
 }
 
+/* 모바일 접속 시 안내 (PC 전용) */
+.app-mobile-block {
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(circle at top left, rgba(56, 189, 248, 0.15), transparent 50%),
+    radial-gradient(circle at bottom right, rgba(244, 114, 182, 0.12), transparent 50%),
+    #0f172a;
+}
+
+.app-mobile-block .app-gate-inner {
+  min-width: 280px;
+}
+
+.app-mobile-block-msg {
+  margin: 1rem 0 0.5rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.app-mobile-block-sub {
+  margin: 0;
+  font-size: 0.875rem;
+  color: #94a3b8;
+}
+
 .app-header {
   padding: 1.5rem 2rem;
   background: #16213e;

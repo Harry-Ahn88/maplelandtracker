@@ -17,11 +17,23 @@ async function sha256(text) {
     .join('')
 }
 
+function isMobileDevice() {
+  if (typeof window !== 'undefined' && (window.location.search.includes('mobile=1') || window.location.hash === '#mobile')) return true
+  if (typeof navigator === 'undefined') return false
+  const ua = navigator.userAgent
+  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua) || (navigator.maxTouchPoints > 0 && window.innerWidth < 1024)
+}
+
 function App() {
   const [unlocked, setUnlocked] = useState(false)
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [mobile, setMobile] = useState(null)
+
+  useEffect(() => {
+    setMobile(isMobileDevice())
+  }, [])
 
   useEffect(() => {
     try {
@@ -48,6 +60,29 @@ function App() {
     } finally {
       setSubmitting(false)
     }
+  }
+
+  if (mobile === null) {
+    return (
+      <div className="app app-mobile-block">
+        <div className="app-gate-inner">
+          <p className="app-mobile-block-sub">확인 중…</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (mobile === true) {
+    return (
+      <div className="app app-mobile-block">
+        <div className="app-gate-inner">
+          <h1 className="app-gate-title">메이플랜드 트래커</h1>
+          <p className="app-gate-desc">메트지지 · maplelandtracker.gg</p>
+          <p className="app-mobile-block-msg">PC에서만 사용 가능합니다.</p>
+          <p className="app-mobile-block-sub">화면 공유·경험치 측정은 PC 브라우저에서 이용해 주세요.</p>
+        </div>
+      </div>
+    )
   }
 
   if (!unlocked) {
