@@ -1743,6 +1743,7 @@ function ExpTracker() {
             <li>이 사이트는 <strong>서버에 데이터를 절대 저장하지 않습니다.</strong> 경험치 측정은 모두 사용자 기기에서만 처리됩니다.</li>
             <li>화면 공유는 <strong>보여주기만</strong> 하며, 키보드·마우스 조작 권한을 요구하거나 가질 수 없습니다.</li>
             <li>공유할 화면·창은 <strong>브라우저가 묻는 대로 사용자가 직접 선택</strong>하며, 언제든 중지할 수 있습니다.</li>
+            <li>화면 공유를 해도 스트림을 어딘가로 보내지 않기 때문에, <strong>화면 공유가 해킹당할 염려는 없습니다.</strong></li>
           </ul>
         </div>
         <p className="exp-tracker-test-badge">1.0 version(test)</p>
